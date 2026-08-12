@@ -24,6 +24,51 @@
 static const struct gpio_dt_spec adv_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static struct gpio_callback adv_btn_cb;
 
+/* DK "Button 2" - held at boot, runs probe_mode() instead of the app. */
+static const struct gpio_dt_spec probe_btn = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
+
+/*
+ * Bring-up aid: find the right hole on the EVM's J8 header without a
+ * multimeter. Reconfigures the uart1 RX pin as a plain input with a pull-down
+ * and reports its level, so a hole that reads HIGH is one something is
+ * actively driving. On a running EVM that is only the radar's TX, which idles
+ * high - ground pins and the DNP pins all read low against the pull-down.
+ * Touch the holes with the RX wire and watch.
+ *
+ * The uart1 driver has already claimed this pin through pinctrl by now; the
+ * GPIO config below rewrites the same PIN_CNF register, and radar_start() is
+ * never reached in this mode, so nothing fights over it.
+ *
+ * ponytail: pin hardcoded to match the uart1_radar RX psel in the overlay.
+ * One pin used in one place - move both together if the RX pin moves.
+ */
+#define PROBE_PIN 5   /* P1.05, the uart1 RX pin */
+
+static void probe_mode(void)
+{
+	const struct device *p1 = DEVICE_DT_GET(DT_NODELABEL(gpio1));
+	int last = -1;
+
+	printk("[PROBE] P1.05 as input with pull-down.\n");
+	printk("[PROBE] touch J8 holes with the RX wire - HIGH means driven.\n");
+
+	if (!device_is_ready(p1) ||
+	    gpio_pin_configure(p1, PROBE_PIN, GPIO_INPUT | GPIO_PULL_DOWN)) {
+		printk("[PROBE] cannot claim the pin\n");
+		return;
+	}
+	while (1) {
+		int v = gpio_pin_get_raw(p1, PROBE_PIN);
+
+		if (v != last) {
+			printk("[PROBE] %s\n",
+			       v ? "HIGH  <-- driven, this is the hole" : "low");
+			last = v;
+		}
+		k_msleep(200);
+	}
+}
+
 /* No debounce: a bounce just re-arms the same 20 s window, which is what a
  * second press would do anyway. */
 static void adv_btn_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
@@ -97,6 +142,14 @@ int main(void)
 	printk("========================================\n");
 	printk("   Presence node: IWRL6432 mmWave\n");
 	printk("========================================\n");
+
+	/* gpio_pin_get_dt() is logical, and the DK's buttons are ACTIVE_LOW, so
+	 * held reads 1. Not held: fall through and run the app as usual. */
+	if (gpio_is_ready_dt(&probe_btn) &&
+	    gpio_pin_configure_dt(&probe_btn, GPIO_INPUT) == 0 &&
+	    gpio_pin_get_dt(&probe_btn) == 1) {
+		probe_mode();   /* never returns */
+	}
 
 	err = store_init();
 	if (err) {

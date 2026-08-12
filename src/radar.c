@@ -50,6 +50,10 @@ static const struct gpio_dt_spec nrst =
 
 RING_BUF_DECLARE(rx_rb, RX_RING_SIZE);
 static uint32_t rx_dropped;
+/* Every byte the uart has ever handed us. The frame counter going quiet says
+ * nothing about which end stopped - this says whether the radar is still
+ * talking while the reassembler sits stuck. */
+static uint32_t rx_total;
 
 /*
  * The presence profile from the IWRL6432 repo, verified 25/25 on this firmware
@@ -70,10 +74,34 @@ static const char *const cfg_lines[] = {
 	"chirpComnCfg 8 0 0 256 4 23 2",
 	"chirpTimingCfg 6 24 0 75 60.5",
 	"frameCfg 2 4 600 4 250 0",
-	/* <pointCloud> <rangeProfile> <noiseProfile> <azHeatMap> <dopHeatMap>
-	 * <stats> <presence> <adcSamples> <tracker> <microDoppler> <classifier> */
-	"guiMonitor 2 0 0 0 0 1 1 0 1 0 0",
-	"sigProcChainCfg 64 4 2 2 4 4 0 0.5",
+	/*
+	 * <pointCloud> <rangeProfile> <noiseProfile> <rangeAzimuthHeatMap>
+	 * <rangeDopplerHeatMap> <statsInfo> <presenceInfo> <adcSamples>
+	 * <trackerInfo> <microDopplerInfo> <classifierInfo> <quickEvalInfo>
+	 *
+	 * Twelve, from this board's own `help`. The published 05.05.04 docs list
+	 * eleven - no quickEvalInfo - and the CLI answers "Done" to either, so
+	 * the short form looked fine and simply left the last field at whatever
+	 * the parser had. Take the count from the firmware, not the docs.
+	 */
+	"guiMonitor 2 0 0 0 0 1 1 0 1 0 0 0",
+	/*
+	 * <azimuthFftSize> <elevationFftSize> <motDetMode> <coherentDoppler>
+	 * <numFrmPerMinorMotProc> <numMinorMotionChirpsPerFrame>
+	 * <forceMinorMotionVelocityToZero> <minorMotionVelocityInclusionThr>
+	 *
+	 * motDetMode: 1 = major motion only, 2 = minor motion only,
+	 * 3 = auto (both). It used to be 2, copied from the IWRL6432 repo's
+	 * presence profile, and that is what kept the tracker silent: the group
+	 * tracker runs on the MAJOR motion point cloud, so in minor-only mode it
+	 * has no input and TARGET_LIST is never emitted - the frame carries only
+	 * 301/306/315. trackingCfg and guiMonitor's tracker flag were both being
+	 * accepted the whole time; the tracker simply had nothing to track.
+	 *
+	 * 3 keeps minor-motion presence (a person sitting still still registers)
+	 * and adds the major-motion chain that feeds the tracker.
+	 */
+	"sigProcChainCfg 64 4 3 2 4 4 0 0.5",
 	"cfarCfg 2 8 4 3 0 15 0 0.5 0 1 1 1",
 	"aoaFovCfg -70 70 -60 60",
 	"rangeSelCfg 0.25 7.5",
@@ -88,14 +116,50 @@ static const char *const cfg_lines[] = {
 	"minorStateCfg 4 3 12 8 5 20 4 20",
 	"clusterCfg 1 1 2",
 	/*
-	 * <enable> <paramSet> <numPoints> <numTracks> <maxDoppler> <framePeriod>
-	 * plus a seventh argument the board's `help` does not list. Six args is
-	 * what help prints and what every published profile uses, and this
-	 * firmware rejects all of them with "Invalid usage"; seven is accepted.
-	 * (cfarCfg has the same problem - help says 8, it takes 12.) The trailing
-	 * 0 is unnamed, so it is left at 0.
+	 * <enable> <initialConfigParams> <maxNumPoints> <maxNumTracks>
+	 * <maxRadialVelocity> <radialVelocityResolution> <deltaT>
+	 * [<boresightFilteringEnable>]   - MMWAVE-L-SDK 05.05 demo guide
+	 *
+	 * Seven required, the eighth optional. Believe the guide here and not the
+	 * board's own `help`, which prints a six-field summary
+	 * (<maxDoppler> <framePeriod> in place of the last three) that the parser
+	 * does not accept: sending exactly those six gets "Error: I...". The
+	 * seven-field form is accepted. `help` is an abbreviation, not a spec.
+	 *
+	 * maxRadialVelocity is 10x m/s, radialVelocityResolution is mm/s, and
+	 * deltaT is the frame period in ms, which has to match frameCfg (250).
+	 *
+	 * An earlier "1 2 250 20 0 250 0" - reverse engineered from that same
+	 * `help` line - put 0 in maxRadialVelocity and asked for 20 tracks. The
+	 * CLI answers "Done" and sensorStart then dies with "Tracker DPU config
+	 * return error:-30907" (tracker DPU base -30900, -7 =
+	 * EMAX_NUM_TRACKS_EXCEEDED).
+	 *
+	 * ponytail: the two velocity numbers are TI's, not derived from the chirp
+	 * config above. They feed the tracker's motion model, so being off
+	 * degrades tracking rather than breaking it - retune with TI's Sensing
+	 * Estimator if fast walkers drop out.
 	 */
-	"trackingCfg 1 2 250 20 0 250 0",
+	"trackingCfg 1 2 100 3 61.4 191.8 250",
+	/*
+	 * NOT sent, deliberately:
+	 *
+	 *   boundaryBox -3.5 3.5 0 7 0 3
+	 *   staticBoundaryBox -3 3 0.5 6 0 3
+	 *
+	 * GTRACK only allocates a track inside boundaryBox, so on paper these
+	 * are what the tracker needs. Both are accepted, sensorStart is accepted
+	 * - and then the demo stops transmitting the instant the major motion
+	 * chain first produces points. Reproduced twice on 05.05.03.00, both at
+	 * "pts 2": the last frame prints, the uart byte counter freezes to the
+	 * byte, and nothing comes back short of NRST. Without them the same
+	 * build streams through point clouds of 15 without trouble.
+	 *
+	 * So the tracker allocation path takes this image down. Records carry
+	 * SNTL_FLAG_NO_TRACKER and headcount stays a 0/1 floor until the EVM is
+	 * reflashed with an image whose tracker survives - a much better trade
+	 * than a sensor that dies the first time somebody walks past it.
+	 */
 	"sensorStart 0 0 0 0",
 };
 
@@ -124,6 +188,19 @@ void radar_window_take(struct radar_window *out)
 	out->occ_s = acc.frames ? (uint8_t)((uint32_t)acc.occ_frames * STORE_PERIOD_S /
 					    acc.frames)
 				: 0;
+
+	/*
+	 * No frames at all this window means the sensor is not reporting, and
+	 * the occupancy clock then has no basis: occ_since is only ever cleared
+	 * from on_frame(), so with the stream dead it keeps running and dwell
+	 * climbs forever. Observed on the bench - the demo stopped streaming and
+	 * the node went on recording headcount 0, occupied 0 s, dwell 201 s, 231,
+	 * 261 ... 711 and rising. A reader cannot tell that from a genuine long
+	 * occupancy. Stop the clock; SNTL_FLAG_SENSOR_FAULT already marks why.
+	 */
+	if (!out->alive) {
+		acc.occ_since = 0;
+	}
 
 	held = acc.occ_since ? (k_uptime_get() - acc.occ_since) / 1000 : 0;
 	out->dwell_s = (held > UINT16_MAX) ? UINT16_MAX : (uint16_t)held;
@@ -154,6 +231,7 @@ static void uart_isr(const struct device *dev, void *user)
 		if (n <= 0) {
 			break;
 		}
+		rx_total += n;
 		if (ring_buf_put(&rx_rb, b, n) < (uint32_t)n) {
 			rx_dropped++;
 		}
@@ -184,6 +262,34 @@ static void cli_write(const char *s)
  * wrong speed, or while the sensor is streaming, a reply contains neither
  * "Done" nor "Error", so absence of an error means nothing.
  */
+/* Bring-up diagnostics: what the last cli_wait() actually heard. 0 bytes means
+ * nothing reaches uart1 RX at all (wiring, or EVM switch S1.4 still off);
+ * bytes that are not the echoed command mean the baud rate is wrong. */
+static uint32_t cli_rx_n;
+/* Long enough to hold the echoed command plus the demo's error text after it;
+ * at 41 the interesting half ("Error: Invalid ...") was always cut off. */
+static char cli_rx_head[129];
+
+/*
+ * rx=0 says a byte never arrived; it cannot say whether that is because our TX
+ * never reached the radar or because the radar's TX never reached us. So sample
+ * the RX line itself while waiting. UARTE leaves the pin's GPIO input buffer
+ * connected, so IN still reads the wire while the driver owns it.
+ *
+ *   HI only  - line idling high: the radar's TX is on this hole. Fault is on
+ *              our TX side (wrong hole, or the radar is not hearing us).
+ *   HI+LO    - the line is moving: bytes are being sent but not decoded, so
+ *              suspect baud or framing rather than wiring.
+ *   LO only  - nothing drives it. The overlay's bias-pull-up is off in this
+ *              build, so a dead wire reads low against the radar's absence.
+ *
+ * ponytail: pin number duplicated from the overlay's uart1_radar RX psel.
+ * Two places, one pin - move them together.
+ */
+#define RX_PIN 5   /* P1.05 */
+static const struct device *const gpio_p1 = DEVICE_DT_GET(DT_NODELABEL(gpio1));
+static uint8_t cli_rx_lvl;   /* bit0 = saw low, bit1 = saw high */
+
 static int cli_wait(int timeout_ms)
 {
 	char buf[96];
@@ -192,13 +298,22 @@ static int cli_wait(int timeout_ms)
 	int done = 0;
 
 	buf[0] = '\0';
+	cli_rx_n = 0;
+	cli_rx_head[0] = '\0';
+	cli_rx_lvl = 0;
 	while (k_uptime_get() < deadline) {
 		uint8_t b;
 
 		if (ring_buf_get(&rx_rb, &b, 1) != 1) {
+			cli_rx_lvl |= gpio_pin_get_raw(gpio_p1, RX_PIN) ? 2 : 1;
 			k_msleep(2);
 			continue;
 		}
+		if (cli_rx_n < sizeof(cli_rx_head) - 1) {
+			cli_rx_head[cli_rx_n] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
+			cli_rx_head[cli_rx_n + 1] = '\0';
+		}
+		cli_rx_n++;
 		buf[fill++] = (char)b;
 		buf[fill] = '\0';
 
@@ -221,10 +336,19 @@ static int cli_wait(int timeout_ms)
 
 static int cli_line(const char *line, int timeout_ms)
 {
+	int ok;
+
 	cli_drain();
 	cli_write(line);
 	cli_write("\n");
-	return cli_wait(timeout_ms);
+	ok = cli_wait(timeout_ms);
+	if (!ok) {
+		static const char *const lvl[] = { "?", "LO", "HI", "HI+LO" };
+
+		printk("[RADAR] rx=%u rxpin=%s \"%s\"\n",
+		       cli_rx_n, lvl[cli_rx_lvl & 3], cli_rx_head);
+	}
+	return ok;
 }
 
 /* ---------------- bring-up ---------------- */
@@ -334,13 +458,60 @@ static void on_frame(const uint8_t *frame)
 	}
 	k_mutex_unlock(&acc_lock);
 
+	/*
+	 * Print the TLV type list the first time a type we have not seen before
+	 * turns up, so this is one line at startup and one more the moment the
+	 * tracker finally emits TARGET_LIST. Printing only the first frame is
+	 * not enough: the tracker stays quiet until it has a confirmed target,
+	 * so its TLV appears seconds later, long after frame 0.
+	 *
+	 * ponytail: types are 301..315, so type-300 fits a u32 mask with room
+	 * to spare. Anything outside that range folds into bit 0 and is
+	 * reported once - fine for a bring-up aid, not a parser.
+	 */
+	{
+		static uint32_t types_seen;
+		struct tlv_header h;
+		uint32_t off = TLV_HDR_LEN;
+		uint32_t mask = 0;
+
+		tlv_header_get(frame, &h);
+		for (uint32_t i = 0; i < h.num_tlvs && off + 8 <= h.total_len; i++) {
+			uint32_t t, l;
+
+			memcpy(&t, frame + off, 4);
+			memcpy(&l, frame + off + 4, 4);
+			mask |= BIT((t - 300) & 31);
+			off += 8 + l;
+		}
+		if (mask & ~types_seen) {
+			types_seen |= mask;
+			off = TLV_HDR_LEN;
+			printk("[RADAR] %u tlvs, %u bytes, %u points:",
+			       h.num_tlvs, h.total_len, h.num_detected);
+			for (uint32_t i = 0; i < h.num_tlvs && off + 8 <= h.total_len; i++) {
+				uint32_t t, l;
+
+				memcpy(&t, frame + off, 4);
+				memcpy(&l, frame + off + 4, 4);
+				printk(" %u(%u B)", t, l);
+				off += 8 + l;
+			}
+			printk("\n");
+		}
+	}
+
 	/* ~1 Hz at the profile's 250 ms frame period. */
 	if (++seen % 4 == 0) {
 		struct tlv_header h;
 
 		tlv_header_get(frame, &h);
-		printk("[%6us] frame %u  %s %d", store_now(), h.frame_no,
-		       tracker ? "targets" : "presence", n);
+		/* num_detected is the major-motion point count, and it is the
+		 * tracker's only input - a steady 0 while someone walks means
+		 * the major chain is producing nothing, which is a different
+		 * problem from the tracker dropping the points it gets. */
+		printk("[%6us] frame %u  %s %d  pts %u", store_now(), h.frame_no,
+		       tracker ? "targets" : "presence", n, h.num_detected);
 		for (int i = 0; i < n && tracker && i < 4; i++) {
 			printk("  #%u(%d,%dcm)", tgt[i].tid,
 			       (int)(tgt[i].x * 100.0f), (int)(tgt[i].y * 100.0f));
@@ -356,6 +527,14 @@ static void on_frame(const uint8_t *frame)
 #define RADAR_STACK    2560
 #define RADAR_PRIORITY 6
 
+/*
+ * Silence longer than this means the sensor is gone, not slow: the profile
+ * runs at 250 ms per frame, so 10 s is forty missed frames. Long enough that a
+ * busy NVS erase or a BLE dump cannot trip it, short enough to lose at most
+ * one 30 s record to the restart.
+ */
+#define RADAR_STALL_MS 10000
+
 static K_THREAD_STACK_DEFINE(radar_stack, RADAR_STACK);
 static struct k_thread radar_thread_data;
 
@@ -363,29 +542,51 @@ static void radar_thread(void *a, void *b, void *c)
 {
 	static struct tlv_reasm re;   /* 2 KB - too big for the thread stack */
 	uint8_t chunk[64];
+	int64_t last_frame;
 
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
 
-	while (radar_configure() != 0) {
-		printk("[RADAR] cfg failed - resetting and retrying in 5 s\n");
-		k_msleep(5000);
-	}
-	printk("[START] radar streaming\n");
-
-	tlv_reset(&re);
 	while (1) {
-		uint32_t n = ring_buf_get(&rx_rb, chunk, sizeof(chunk));
-
-		if (n == 0) {
-			k_msleep(5);
-			continue;
+		while (radar_configure() != 0) {
+			printk("[RADAR] cfg failed - resetting and retrying in 5 s\n");
+			k_msleep(5000);
 		}
-		for (uint32_t i = 0; i < n; i++) {
-			if (tlv_push(&re, chunk[i])) {
-				on_frame(re.buf);
-				tlv_reset(&re);
+		printk("[START] radar streaming\n");
+
+		tlv_reset(&re);
+		last_frame = k_uptime_get();
+
+		while (k_uptime_get() - last_frame < RADAR_STALL_MS) {
+			uint32_t n = ring_buf_get(&rx_rb, chunk, sizeof(chunk));
+
+			if (n == 0) {
+				k_msleep(5);
+				continue;
+			}
+			for (uint32_t i = 0; i < n; i++) {
+				if (tlv_push(&re, chunk[i])) {
+					on_frame(re.buf);
+					tlv_reset(&re);
+					last_frame = k_uptime_get();
+				}
 			}
 		}
+
+		/*
+		 * The demo can stop dead - it did so reproducibly the moment the
+		 * tracker allocation path was enabled - and nothing short of
+		 * NRST brings it back, which is what radar_configure() starts
+		 * with. Left alone the node goes on writing empty records
+		 * forever; the bench run filled 14 minutes that way.
+		 *
+		 * The counters say which end failed: bytes frozen means the
+		 * radar stopped, bytes still climbing with a non-zero reasm len
+		 * means it is talking and we lost framing.
+		 */
+		printk("[RADAR] stalled %d s: %u bytes in, %u dropped, "
+		       "reasm len=%u want=%u match=%u - reconfiguring\n",
+		       RADAR_STALL_MS / 1000, rx_total, rx_dropped,
+		       re.len, re.want, re.match);
 	}
 }
 

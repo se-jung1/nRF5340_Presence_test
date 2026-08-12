@@ -8,14 +8,28 @@
  * All four come off the EVM's LP/BP connector (J8/J9) - no soldering. SWRU596
  * Figure 3-5 shows UART, RESET, SPI, I2C and SOP0/SOP1 routed there.
  *
- *   nRF5340 DK          IWRL6432BOOST J8/J9
- *   P1.00 (D1, TX)  ->  UART RX
- *   P1.01 (D0, RX)  <-  UART TX
- *   P1.05 (D3)      ->  RESET  (NRST, open drain, active low)
- *   GND             --  GND
+ * Arduino labels are from the DK's own gpio-map (nrf5340dk_common.dtsi), and
+ * they do not track the port pin numbers: D2 is P1.04, D3 is P1.05, D4 is
+ * P1.06. Check that map before wiring by the silk screen - our TX landing on
+ * the radar's TX gives a dead link that looks exactly like a missing ground.
+ *
+ *   nRF5340 DK          IWRL6432BOOST
+ *   P1.04 (D2, TX)  ->  J8 pin 7   (DCA_LP_RS232_RX, radar input)
+ *   P1.05 (D3, RX)  <-  J8 pin 5   (DCA_LP_RS232_TX, radar output)
+ *   P1.06 (D4)      ->  J9 pin 10  (RADAR_NRST_2, open drain, active low)
+ *   GND             --  J8 pin 4   (or J9 pin 2)
+ *
+ * J8 pin 4 is the ONLY ground on that header. Pin 2 is MCU_5V and pin 1 is
+ * MCU_3V3 - both are LaunchPad-side power inputs, and both feed through DNP
+ * resistors (R87, R132), so they sit floating and read as nothing. Grounding
+ * there costs no damage and gives no ground: the two boards end up with no
+ * shared reference and the link is dead with rx=0, which looks identical to
+ * a wrong data pin. Schematic sheet 15 (SWRR180), verified pin by pin.
  *
  * Free pins were picked around what the DK already uses: LEDs P0.28-31,
- * buttons P0.08/09/23/24, i2c1 P1.02/03, spi4 P1.13-15.
+ * buttons P0.08/09/23/24, i2c1 P1.02/03, spi4 P1.13-15. P1.00/P1.01 (D0/D1)
+ * were the original choice and work equally well - moved off them only to rule
+ * the header out during bring-up.
  *
  * NOTE: set S1.4 = ON on the EVM. It is a DIP switch, not a jumper. Per
  * SWRU596 Figure 4-1, S1.4 OFF sends the UART to XDS_RS232 (the on-board
@@ -36,25 +50,41 @@
 	 * drain in code so the EVM's own reset circuit is never fought.
 	 */
 	zephyr,user {
-		radar-nrst-gpios = <&gpio1 5 GPIO_ACTIVE_LOW>;
+		radar-nrst-gpios = <&gpio1 6 GPIO_ACTIVE_LOW>;   /* D4 */
 	};
 };
 
 &pinctrl {
 	uart1_radar: uart1_radar {
 		group1 {
-			psels = <NRF_PSEL(UART_TX, 1, 0)>;
+			psels = <NRF_PSEL(UART_TX, 1, 4)>;   /* D2 */
 		};
 		group2 {
-			psels = <NRF_PSEL(UART_RX, 1, 1)>;
-			bias-pull-up;   /* idle high while the radar is in reset */
+			psels = <NRF_PSEL(UART_RX, 1, 5)>;   /* D3 */
+			/*
+			 * Idle high while the radar is in reset. Note R95/R96
+			 * on the EVM already pull both RS232 lines to 3V3, but
+			 * at 100k - too weak to hold the line against this
+			 * pin's own pull-down, so the bias here has to be the
+			 * pull-up and not merely absent.
+			 *
+			 * Flip this to bias-pull-down when hunting for the
+			 * right hole on J8: radar.c prints rxpin= on a failed
+			 * CLI line, and against a pull-down only an actively
+			 * driven pin reads high. On J8 that is exactly two
+			 * pins - 5 (the radar's TX) and 14 (PGOOD) - which is
+			 * enough to fix both the column and the pin 1 end
+			 * without a multimeter. With the pull-up in place
+			 * every hole reads high and the readout is useless.
+			 */
+			bias-pull-up;
 		};
 	};
 
 	uart1_radar_sleep: uart1_radar_sleep {
 		group1 {
-			psels = <NRF_PSEL(UART_TX, 1, 0)>,
-				<NRF_PSEL(UART_RX, 1, 1)>;
+			psels = <NRF_PSEL(UART_TX, 1, 4)>,
+				<NRF_PSEL(UART_RX, 1, 5)>;
 			low-power-enable;
 		};
 	};
@@ -66,6 +96,18 @@
  * entry for 1250000, and with the range profile TLV turned off the stream is a
  * few hundred bytes per frame at 4 fps - about 3% of what 115200 carries.
  */
+/*
+ * On the nRF5340, uart1/spi1/i2c1 are three faces of one peripheral instance
+ * (SERIAL1 at 0x40009000). The DK board files leave i2c1 enabled for the
+ * Arduino header, so with uart1 also on it the two nodes claim the same
+ * hardware. It happens to be harmless in this build - CONFIG_I2C is off, so no
+ * TWIM driver is ever instantiated - but the moment anything pulls I2C in, the
+ * two would fight over the instance. Turn it off here rather than rely on that.
+ */
+&i2c1 {
+	status = "disabled";
+};
+
 &uart1 {
 	status = "okay";
 	current-speed = <115200>;

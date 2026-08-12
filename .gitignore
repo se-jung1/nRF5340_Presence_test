@@ -1,4 +1,4 @@
-build/
+build*/
 tests/test_frame
 tests/test_tlv
 tests/*.exe
