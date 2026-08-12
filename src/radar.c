@@ -56,17 +56,25 @@ static uint32_t rx_dropped;
 static uint32_t rx_total;
 
 /*
- * The presence profile from the IWRL6432 repo, verified 25/25 on this firmware
- * (SDK 05.05.03.00), with three changes:
- *   - guiMonitor: range profile off (512 B/frame nobody reads), tracker on
- *   - trackingCfg added, 6-arg form because that is what this board's `help`
- *     prints. If it is rejected the sensor still streams presence and records
- *     carry SNTL_FLAG_NO_TRACKER - see radar_configure().
+ * The presence profile from the IWRL6432 repo, 22/22 accepted on this board
+ * (xWRL6432 MMW Demo 05.05.03.00), with four changes:
+ *   - guiMonitor: range profile off (512 B/frame nobody reads), tracker on,
+ *     and twelve arguments rather than the documented eleven
+ *   - sigProcChainCfg: motDetMode 3 rather than 2, so the major-motion chain
+ *     runs as well as minor-motion presence
+ *   - trackingCfg added, seven-argument form
  *   - baudRate removed, see the file header
  *
- * Do not drop sigProcChainCfg: its motDetMode 2 is what enables minor-motion
- * (presence) detection at all. Its 8-argument form is this firmware's; the
- * published 05.05.04 profile has 9.
+ * Argument counts here come from what the parser accepts on this image, not
+ * from the published 05.05.04 guide and not from the board's own `help`. Both
+ * are wrong about at least one line, in opposite directions, and the CLI
+ * answers "Done" to a short guiMonitor without complaint - so a wrong count
+ * shows up as behaviour that quietly differs, never as an error. Each line
+ * below that was got wrong once carries the details.
+ *
+ * Do not drop sigProcChainCfg: it is what enables minor-motion (presence)
+ * detection at all. Its 8-argument form is this firmware's; the published
+ * 05.05.04 profile has 9.
  */
 static const char *const cfg_lines[] = {
 	"sensorStop 0",
