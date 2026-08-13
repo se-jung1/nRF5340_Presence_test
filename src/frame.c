@@ -47,6 +47,16 @@ void sntl_encode_record(uint8_t *out, const struct sntl_record *rec)
 	out[11] = (uint8_t)(rec->dwell_s >> 8);
 	out[12] = rec->flags;
 	out[13] = rec->batt;
+	out[14] = (uint8_t)(rec->pm25);
+	out[15] = (uint8_t)(rec->pm25 >> 8);
+	out[16] = (uint8_t)(rec->pm10);
+	out[17] = (uint8_t)(rec->pm10 >> 8);
+	out[18] = (uint8_t)(rec->temp);
+	out[19] = (uint8_t)((uint16_t)rec->temp >> 8);
+	out[20] = (uint8_t)(rec->rh);
+	out[21] = (uint8_t)((uint16_t)rec->rh >> 8);
+	out[22] = (uint8_t)(rec->voc);
+	out[23] = (uint8_t)((uint16_t)rec->voc >> 8);
 }
 
 size_t sntl_frame_size(uint16_t record_count)

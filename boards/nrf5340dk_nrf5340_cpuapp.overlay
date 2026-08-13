@@ -1,5 +1,24 @@
 /*
- * nRF5340 DK <-> IWRL6432BOOST.
+ * nRF5340 DK <-> IWRL6432BOOST (uart1) + Sensirion SEN5x (i2c2).
+ *
+ *   SEN5x pin      nRF5340 DK
+ *   1 VDD      ->  5V   (P20 power header. NOT 3V3 - the fan and laser want
+ *                        5 V +-10 %, and the DK's 5V comes straight off USB)
+ *   2 GND      --  GND
+ *   3 SDA      <-> P1.02  (Arduino "SDA")
+ *   4 SCL      <-  P1.03  (Arduino "SCL")
+ *   5 SEL      --  GND    (selects I2C, and it must already be low when the
+ *                          sensor powers up - wire it, do not strap it later)
+ *   6 NC       --  leave it
+ *
+ * Logic is 3.3 V tolerant, so no level shifter even though VDD is 5 V. The
+ * datasheet asks for external 10k pull-ups on SDA/SCL; bias-pull-up below uses
+ * the nRF's own ~13k, which is enough on a short bench lead and marginal on a
+ * long one. Fit the 10k for anything that leaves the desk.
+ *
+ * Keep the shield of the sensor floating (datasheet 4): its metal can is tied
+ * to pin 2 internally, and giving that a second path to ground can push current
+ * through the case.
  *
  * Three wires plus ground. Two are not enough: the demo cannot be reconfigured
  * without a reset, so the nRF5340 has to drive NRST itself. Both sides are
@@ -88,6 +107,26 @@
 			low-power-enable;
 		};
 	};
+
+	/*
+	 * Same two physical pins the DK silk-screens as SDA/SCL - only the
+	 * peripheral behind them changes, since nRF pins are fully muxable.
+	 */
+	i2c2_sen5x: i2c2_sen5x {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 1, 2)>,
+				<NRF_PSEL(TWIM_SCL, 1, 3)>;
+			bias-pull-up;
+		};
+	};
+
+	i2c2_sen5x_sleep: i2c2_sen5x_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 1, 2)>,
+				<NRF_PSEL(TWIM_SCL, 1, 3)>;
+			low-power-enable;
+		};
+	};
 };
 
 /*
@@ -100,12 +139,30 @@
  * On the nRF5340, uart1/spi1/i2c1 are three faces of one peripheral instance
  * (SERIAL1 at 0x40009000). The DK board files leave i2c1 enabled for the
  * Arduino header, so with uart1 also on it the two nodes claim the same
- * hardware. It happens to be harmless in this build - CONFIG_I2C is off, so no
- * TWIM driver is ever instantiated - but the moment anything pulls I2C in, the
- * two would fight over the instance. Turn it off here rather than rely on that.
+ * hardware. That used to be harmless here because CONFIG_I2C was off; the
+ * SEN5x turned it on, which is exactly the moment the two start fighting. The
+ * sensor therefore hangs off i2c2 (SERIAL2 at 0x4000B000, otherwise unused on
+ * this board) driven out to the same two header pins.
  */
 &i2c1 {
 	status = "disabled";
+};
+
+&i2c2 {
+	status = "okay";
+	/* Standard mode is all the SEN5x supports, and it does not clock
+	 * stretch (datasheet 6). */
+	clock-frequency = <100000>;
+	pinctrl-0 = <&i2c2_sen5x>;
+	pinctrl-1 = <&i2c2_sen5x_sleep>;
+	pinctrl-names = "default", "sleep";
+
+	/* No compatible: there is no in-tree SEN5x driver and src/sen5x.c
+	 * speaks the three commands it needs directly. The node exists so the
+	 * address and the bus come from devicetree rather than a #define. */
+	sen5x: sen5x@69 {
+		reg = <0x69>;
+	};
 };
 
 &uart1 {
@@ -118,10 +175,16 @@
 };
 
 /*
- * 24 h of records is 2880 * (16 B struct + 8 B NVS overhead) = ~69 KB, so the
- * board default 32 KB storage_partition would have no room left for garbage
- * collection. Take the space from slot1_partition, the MCUboot secondary slot,
- * which is dead weight here - this build has no DFU.
+ * 24 h of records is 2880 * (24 B struct + 8 B NVS overhead) = ~90 KB at the
+ * 30 s test period, so the board default 32 KB storage_partition would not even
+ * hold the data, let alone leave room for garbage collection. Take the space
+ * from slot1_partition, the MCUboot secondary slot, which is dead weight here -
+ * this build has no DFU.
+ *
+ * 90 KB of 160 KB is the tightest this gets: at the intended 60 s period it is
+ * 45 KB. NVS needs a spare sector to garbage-collect into and gets 17 of them
+ * here, so even the test period has margin - but do not shorten the period
+ * further without redoing this sum.
  *
  *   slot1   0x84000 .. 0xD8000  (336K, was 464K)
  *   storage 0xD8000 .. 0x100000 (160K, was 32K)

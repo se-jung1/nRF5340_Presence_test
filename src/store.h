@@ -1,5 +1,5 @@
 /*
- * Flash-backed ring of occupancy records.
+ * Flash-backed ring of occupancy + air quality records.
  *
  * Holds 24 h at one record per STORE_PERIOD_S. seq is monotonic and survives
  * reset - the app and server dedupe on (device_id, seq), so restarting at 0

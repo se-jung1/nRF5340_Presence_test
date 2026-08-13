@@ -1,16 +1,21 @@
 /*
- * SNTL wire frame - node to app. Version 2: presence node.
+ * SNTL wire frame - node to app. Version 3: presence + air quality.
  *
- * Same envelope as the air-quality node (nRF5340_Wearable) - magic, header,
- * fixed records, trailing CRC - but the record carries radar occupancy instead
- * of PM. The version byte is what tells the app which one it is talking to;
- * both records are 14 bytes, so length alone will not tell them apart.
+ * Same envelope throughout the family - magic, header, fixed records, trailing
+ * CRC. The version byte says which record shape follows, and it has to: v1 (the
+ * air-quality node, nRF5340_Wearable) and v2 (presence only) are both 14 bytes,
+ * so length alone will not tell them apart.
+ *
+ * v3 = v2's 14 bytes unchanged, with the SEN5x fields appended. A reader that
+ * already decodes v2 keeps every offset it has and only gains a tail; one that
+ * does not care about air quality can read a v3 record as a v2 record by
+ * ignoring bytes 14..23.
  *
  * Deliberately plain C (stdint/string only, no Zephyr) so tests/test_frame.c
  * can build and run on the host. Do not add Zephyr includes here.
  *
  * Frame layout, all integers little-endian:
- *   header 16 B | record 14 B x recordCount | crc16 2 B
+ *   header 16 B | record 24 B x recordCount | crc16 2 B
  * The CRC covers everything from the first header byte up to (not including)
  * the CRC itself.
  */
@@ -21,11 +26,22 @@
 #include <stddef.h>
 
 #define SNTL_MAGIC          "SNTL"
-#define SNTL_VERSION        2
-#define SNTL_RECORD_SIZE    14
+#define SNTL_VERSION        3
+#define SNTL_RECORD_SIZE    24
 #define SNTL_HEADER_SIZE    16
 #define SNTL_CRC_SIZE       2
 #define SNTL_DEVICE_ID_LEN  8
+
+/*
+ * "Not measured", passed straight through from the SEN5x. A SEN50 has no
+ * RH/T/gas and a SEN54 has no NOx; both answer 0xFFFF for what they lack, as
+ * does any of them before its first conversion. Signed fields use INT16_MAX
+ * because 0xFFFF reads as -1 there, and -0.01 C is a plausible temperature.
+ * Mirrors SEN5X_UNKNOWN_U/_S - kept spelled out here so a reader of the wire
+ * format does not have to go find the driver.
+ */
+#define SNTL_AQ_UNKNOWN_U   0xFFFF
+#define SNTL_AQ_UNKNOWN_S   0x7FFF
 
 /* Control characteristic command: 0x01 then uint32 LE firstSeq. */
 #define SNTL_CMD_DUMP       0x01
@@ -42,6 +58,14 @@
  * The server must not add these up as people.
  */
 #define SNTL_FLAG_NO_TRACKER          0x20
+/*
+ * The SEN5x did not answer this window, or it did and its status register
+ * reported a fan or laser fault. Separate from SENSOR_FAULT, which is the
+ * radar: one node now carries two sensors that fail independently, and a dead
+ * fan reads as clean air, so this cannot share a bit with anything.
+ * The PM fields are still sent when this is set - tag, never drop.
+ */
+#define SNTL_FLAG_AQ_FAULT            0x40
 
 struct sntl_record {
 	uint32_t seq;
@@ -51,6 +75,12 @@ struct sntl_record {
 	uint16_t dwell_s;    /* unbroken occupancy at the end of the window */
 	uint8_t  flags;
 	uint8_t  batt;       /* percent, 0..100 */
+	/* --- v3, SEN5x. Peak over the window for PM, last sample for the rest. --- */
+	uint16_t pm25;       /* 0.1 ug/m3 */
+	uint16_t pm10;       /* 0.1 ug/m3 */
+	int16_t  temp;       /* 0.01 C */
+	int16_t  rh;         /* 0.01 %RH */
+	int16_t  voc;        /* 0.1 VOC index */
 };
 
 /*

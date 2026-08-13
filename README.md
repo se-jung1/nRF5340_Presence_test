@@ -1,12 +1,16 @@
-# nRF5340 Presence — 재실 감지 노드
+# nRF5340 Presence — 재실 + 공기질 노드
 
 nRF5340 DK (Zephyr / nRF Connect SDK). TI **IWRL6432BOOST** 60 GHz mmWave 레이더를
-UART로 물려서 **근로자 수와 체류 시간을 30초마다 플래시에 쌓고**, 버튼을 누르면
-**BLE로 모바일 앱에 넘긴다.**
+UART로, Sensirion **SEN5x** 미세먼지 센서를 I2C로 물려서 **재실·체류 시간과 PM2.5/PM10을
+30초마다 플래시에 쌓고**, 버튼을 누르면 **BLE로 모바일 앱에 넘긴다.**
 
 공기질 노드([nRF5340_Wearable](../nRF5340_Wearable))와 같은 저장/전송 구조(SNTL 프레임,
-NVS 24시간 링, BLE 덤프)를 쓰되 레코드 내용만 재실 데이터로 바꾼 것이다. 프레임
-**version 바이트가 2**라서 앱이 둘을 구분한다.
+NVS 24시간 링, BLE 덤프)를 쓴다. 프레임 **version 바이트가 3**이고 (v1 = 공기질 전용,
+v2 = 재실 전용), 레코드는 **v2의 14바이트를 그대로 두고 뒤에 10바이트를 붙인 형태**라
+v2를 읽던 코드는 오프셋을 하나도 안 바꿔도 된다.
+
+두 센서는 서로 독립적으로 죽는다. 레이더가 죽으면 `SENSOR_FAULT`, SEN5x가 죽으면
+`AQ_FAULT`가 붙고, 한쪽 고장이 다른 쪽 값을 막지 않는다.
 
 레이더 브링업 기록과 Python 도구는 원본 저장소에 있다:
 [JeonJunYoung-hub/IWRL6432](https://github.com/JeonJunYoung-hub/IWRL6432).
@@ -32,6 +36,35 @@ IWRL6432의 NRST를 직접 잡아야 한다. 양쪽 다 3.3V 로직이라 레벨
 
 Arduino 실크와 포트 번호는 서로 어긋난다 (D0=P1.00, D1=P1.01, **D2=P1.04**, D3=P1.05,
 D4=P1.06). 숫자만 보고 P1.04를 D4에 꽂으면 NRST 자리에 TX가 간다.
+
+### SEN5x (미세먼지)
+
+커넥터는 ACES 51451-0060N-001, 짝은 JST GHR-06V-S로도 된다. 6핀 중 1번이 공기 배출구 쪽.
+
+| SEN5x | | nRF5340 DK |
+|---|---|---|
+| 1 VDD | ← | **5V** (전원 헤더) |
+| 2 GND | — | GND |
+| 3 SDA | ↔ | **P1.02** (실크 **SDA**) |
+| 4 SCL | ← | **P1.03** (실크 **SCL**) |
+| 5 SEL | — | **GND** |
+| 6 NC | | 연결 안 함 |
+
+주의할 것 세 가지:
+
+- **VDD는 5V다.** 3V3에 꽂으면 팬과 레이저가 안 돈다. 데이터시트 5V ±10%, DK의 5V 핀은
+  USB에서 바로 온다.
+- **SEL은 전원이 들어오기 전 또는 동시에 GND여야 I2C가 선택된다.** 나중에 꽂으면 안 잡힌다.
+  선으로 GND에 묶어두면 된다.
+- **금속 케이스는 띄워둔다.** 내부에서 2번 핀(GND)과 연결돼 있어서, 케이스에 별도 접지를
+  주면 그 경로로 전류가 흐른다 (데이터시트 4장).
+
+로직은 3.3V 호환이라 레벨 시프터는 필요 없다. 풀업은 데이터시트가 외부 10k를 권하지만
+지금은 nRF 내장 풀업(~13k)을 쓴다 — 짧은 점퍼선에서는 붙고, 긴 배선이면 10k를 달아라.
+
+**I2C는 i2c1이 아니라 i2c2다.** nRF5340에서 uart1과 i2c1은 같은 SERIAL1 인스턴스라
+레이더와 충돌한다. 핀은 DK가 SDA/SCL이라 찍어놓은 그 자리(P1.02/P1.03) 그대로 쓰고
+뒤에 붙는 페리페럴만 i2c2로 바꿨다.
 
 ### 스위치
 
@@ -80,6 +113,8 @@ flowchart TD
     NRST["NRST 펄스"]
     PARSE["tlv_push()<br/>magic + totalPacketLen"]
     ACC["윈도우 누적<br/>최대 인원 · 점유 프레임 · dwell"]
+    SEN["SEN5x<br/>팬 + 레이저 산란"]
+    POLL["1초마다 읽기<br/>PM 최댓값 · 온습도 마지막값"]
     REC["30초마다 레코드 1건"]
     NVS[("NVS 링버퍼<br/>2880건 = 24시간")]
     BTN["Button 1 · P0.23"]
@@ -92,6 +127,8 @@ flowchart TD
     RAD -->|"UART 115200<br/>TLV 4 fps"| PARSE
     PARSE --> ACC
     ACC --> REC
+    SEN -->|"I2C 100k<br/>0x69"| POLL
+    POLL --> REC
     REC --> NVS
     BTN --> ADV
     ADV --> DUMP
@@ -105,6 +142,7 @@ flowchart TD
         ACC
     end
     subgraph ml["메인 루프 · 절대 1초 케이던스"]
+        POLL
         REC
     end
     subgraph th["전용 스레드 · 수 초 소요"]
@@ -124,6 +162,16 @@ ID = `0x100 + (seq % STORE_CAPACITY)` 라서 링버퍼가 공짜로 된다. 별�
 
 주기는 `src/store.h` 의 `STORE_PERIOD_S` 한 줄, 용량은 거기서 자동 계산돼 항상 24시간치다.
 **지금은 테스트용 30초다.** `occ_s` 가 1바이트라 255를 넘기면 안 된다.
+
+레코드가 24바이트로 커지면서 30초 주기 기준 하루치가 **2880 × 32B ≈ 90KB** (160KB 파티션)
+가 됐다. 60초로 돌리면 45KB. 더 짧게 할 거면 이 계산부터 다시 해라.
+
+**포맷이 바뀌면 기존 레코드는 지운다.** `nvs_read()` 는 `sizeof(struct sntl_record)` 를
+정확히 요구해서 옛 16바이트 엔트리는 읽히지도 않고, 다시 쓰이지도 않으니 NVS가 회수도
+못 한다. 그래서 ID 2에 레코드 크기를 적어두고 다를 때 `nvs_clear()` 한다. **`seq` 는
+살린다** — 서버가 `(device_id, seq)` 로 중복을 거르므로 0부터 다시 세면 새 데이터가
+옛 데이터와 충돌해서 버려진다. 대신 ID 3에 "여기 아래는 없다" 하한선을 적어서, 방금
+지운 구간을 앱이 요청하는 일이 없게 했다.
 
 ### 시간
 
@@ -151,14 +199,16 @@ ID = `0x100 + (seq % STORE_CAPACITY)` 라서 링버퍼가 공짜로 된다. 별�
 `SL` 과 달라서 스캔 목록에서 바로 구분된다. 앱이나 서버가 `SL` 로 필터링한다면
 `src/ble.h` 의 `BLE_ID_PREFIX` 한 줄을 되돌리면 된다.
 
-### 프레임 포맷 (version 2)
+### 프레임 포맷 (version 3)
 
-모든 정수 리틀엔디언. 전체 길이 = `16 + 14 × recordCount + 2`. 봉투는 v1과 같고
-**레코드 내용만 다르다.**
+모든 정수 리틀엔디언. 전체 길이 = `16 + 24 × recordCount + 2`. 봉투는 v1·v2와 같다.
 
 ```
-헤더 16B   magic "SNTL" | version 2 | recordSize 14 | recordCount u16 | deviceId 8B
-레코드 14B  seq u32 | ts u32 | headcount u8 | occ_s u8 | dwell_s u16 | flags u8 | batt u8
+헤더 16B   magic "SNTL" | version 3 | recordSize 24 | recordCount u16 | deviceId 8B
+레코드 24B  [v2와 동일한 앞 14B]
+            seq u32 | ts u32 | headcount u8 | occ_s u8 | dwell_s u16 | flags u8 | batt u8
+           [v3에서 추가된 뒤 10B]
+            pm25 u16 | pm10 u16 | temp i16 | rh i16 | voc i16
 꼬리 2B    crc16
 ```
 
@@ -167,6 +217,23 @@ ID = `0x100 + (seq % STORE_CAPACITY)` 라서 링버퍼가 공짜로 된다. 별�
 | `headcount` | 그 윈도우에서 **동시에** 잡힌 최대 인원 |
 | `occ_s` | 윈도우 중 점유였던 초 (0..`STORE_PERIOD_S`) |
 | `dwell_s` | 윈도우가 끝나는 시점의 **끊기지 않은** 재실 시간. 윈도우 경계를 넘어 계속 늘어난다 |
+| `pm25`, `pm10` | 0.1 µg/m³ 단위. 윈도우 안 **최댓값** |
+| `temp` | 0.01 °C |
+| `rh` | 0.01 %RH |
+| `voc` | 0.1 VOC 지수 (SEN54/SEN55만) |
+
+**PM만 최댓값이고 나머지는 마지막 값이다.** 30초 창 안에서 10초짜리 분진 이벤트가
+일어나는 게 이 제품이 잡아야 할 바로 그 상황이라, 평균을 내면 그게 지워진다. 온습도는
+그만큼 빨리 안 변해서 마지막 샘플이 창 전체를 대표한다.
+
+**"측정 안 됨"** — SEN50은 온습도·가스 센서가 아예 없고 SEN54는 NOx가 없다. 없는 값은
+센서가 `0xFFFF`로 답하고 그대로 흘려보낸다. 부호 있는 필드(`temp`/`rh`/`voc`)만
+`0x7FFF`를 쓴다 — `0xFFFF`는 거기서 `-1`이고 −0.01 °C는 충분히 있을 법한 값이라서다.
+
+플래그 `0x40 AQ_FAULT` = 이번 창에 SEN5x 응답이 없었거나, 응답했지만 상태 레지스터가
+팬/레이저 고장을 알렸다는 뜻. **이때도 PM 값은 그대로 보낸다** — 버리지 않고 표시만 한다.
+팬이 멈추면 PM이 낮게 읽히고 그건 "공기 깨끗함"으로 보이기 때문에, 레이더 쪽
+`SENSOR_FAULT`와 비트를 공유하지 않는다.
 
 CRC-16/CCITT-FALSE — poly `0x1021`, init `0xFFFF`, 반전 없음, 최종 XOR 없음.
 검증 벡터 `"123456789"` → `0x29B1`.
@@ -278,6 +345,26 @@ gcc -I../src -o test_tlv   test_tlv.c   ../src/tlv.c   && ./test_tlv
 쓰레기 바이트, **거짓 `totalPacketLen` 후 재동기**, 잘린 TLV 길이, GTRACK_3D/2D 자동 판별.
 합성 프레임은 원본 저장소 `tools/tlv.py` 의 자체 검증과 같은 값을 쓴다 — 양쪽 디코더가
 같은 레이아웃을 본다는 뜻이다.
+
+`test_frame` 은 v3 레코드 24바이트를 바이트 오프셋까지 확인하고, 영하 온도가 2의 보수로
+살아 넘어가는지와 `0x7FFF` 센티널과 안 겹치는지도 본다.
+
+앱 쪽 짝은 `sentinel_app/test/packet_test.dart` 다 (`flutter test`). 인코드→파스 왕복,
+"측정 안 됨"이 0 이 아니라 null 로 오는지, 영하 온도를 같이 본다. **펌웨어의
+`src/frame.h` 와 앱의 `lib/data/packet.dart` 는 같이 고쳐야 한다.**
+
+### 아직 실물 검증 안 된 것
+
+**SEN5x 는 코드만 있고 실물에서 안 돌려봤다.** 레이더 쪽(링크·cfg·TLV·NVS·BLE 덤프·
+스톨 복구)은 전부 실측이 끝났지만, 미세먼지 센서는 배선 후 아래를 확인해야 한다:
+
+1. 부팅 로그에 `[SEN5x] SEN55` (또는 SEN50/SEN54) — 여기까지 나오면 I2C 배선이 맞다
+2. `[READY] SEN5x measuring`
+3. 30초 뒤 `[STORE] ... pm2.5 12.3  pm10 45.6  23.50 C  45%RH`
+4. `dl.py` 로 받은 값이 3번 콘솔 값과 일치 — 어긋나면 바이트 오프셋이 틀린 것이다
+
+센서를 안 꽂아도 부팅은 된다. `[ERROR] SEN5x start failed` 가 뜨고 모든 레코드에
+`AQ_FAULT` 가 붙는다.
 
 ## 시리얼 확인
 

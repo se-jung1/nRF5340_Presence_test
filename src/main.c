@@ -1,10 +1,13 @@
 /*
- * Presence node: IWRL6432BOOST mmWave radar over uart1.
+ * Presence + air quality node: IWRL6432BOOST mmWave radar over uart1, Sensirion
+ * SEN5x over i2c2.
  *
  * - one record per STORE_PERIOD_S into flash (24 h ring), handed out over BLE
  * - the radar does all the signal processing on its own Cortex-M4F and sends
  *   only results, so this core does framing, counting and storage - nothing
  *   here is real-time critical
+ * - the two sensors fail independently and each has its own flag; neither
+ *   failure suppresses the other's numbers
  *
  * There is no calendar clock on this chip: RTC0/RTC1 are plain 32.768 kHz
  * counters and the DK has no battery-backed RTC, so every record carries
@@ -18,6 +21,7 @@
 #include "ble.h"
 #include "frame.h"
 #include "radar.h"
+#include "sen5x.h"
 #include "store.h"
 
 /* DK "Button 1" (P0.23) - opens the BLE advertising window on press. */
@@ -100,18 +104,29 @@ static int adv_btn_init(void)
 static void window_flush(void)
 {
 	struct radar_window w;
+	struct sen5x_window aq;
 	struct sntl_record rec = { 0 };
 	int err;
 
 	radar_window_take(&w);
+	sen5x_window_take(&aq);
 
 	rec.headcount = w.headcount;
 	rec.occ_s = w.occ_s;
 	rec.dwell_s = w.dwell_s;
 
+	rec.pm25 = aq.pm25;
+	rec.pm10 = aq.pm10;
+	rec.temp = aq.temp;
+	rec.rh = aq.rh;
+	rec.voc = aq.voc;
+
 	if (!w.alive) {
 		/* Tag it, never drop it - this is safety-management data. */
 		rec.flags |= SNTL_FLAG_SENSOR_FAULT;
+	}
+	if (!aq.alive) {
+		rec.flags |= SNTL_FLAG_AQ_FAULT;
 	}
 	if (!w.tracker) {
 		/* headcount is a floor (0 or 1), not a count. */
@@ -127,9 +142,35 @@ static void window_flush(void)
 		printk("[STORE] append failed (%d)\n", err);
 		return;
 	}
-	printk("[STORE] %us  headcount %u%s  occupied %us/%us  dwell %us\n",
+	printk("[STORE] %us  headcount %u%s  occupied %us/%us  dwell %us",
 	       rec.ts, rec.headcount, w.tracker ? "" : " (no tracker)",
 	       rec.occ_s, STORE_PERIOD_S, rec.dwell_s);
+
+	if (rec.pm25 == SNTL_AQ_UNKNOWN_U) {
+		printk("  air: no data\n");
+	} else {
+		/* Split the sign off before dividing: -0.43 C is temp = -43, and
+		 * -43/100 is 0, so "%d.%02d" would print it as 0.43. */
+		int t = (rec.temp == SNTL_AQ_UNKNOWN_S) ? 0 : rec.temp;
+		int ta = (t < 0) ? -t : t;
+
+		printk("  pm2.5 %u.%u  pm10 %u.%u  %s%d.%02d C  %d.%d%%RH",
+		       rec.pm25 / 10, rec.pm25 % 10, rec.pm10 / 10, rec.pm10 % 10,
+		       (t < 0) ? "-" : "", ta / 100, ta % 100,
+		       (rec.rh == SNTL_AQ_UNKNOWN_S) ? 0 : rec.rh / 100,
+		       (rec.rh == SNTL_AQ_UNKNOWN_S) ? 0 : (rec.rh / 10) % 10);
+
+		/* A SEN50 has no gas sensor, so this stays "--" there for good.
+		 * On a SEN54/55 it climbs from 0 to about 100 over the first few
+		 * minutes - that is the index algorithm learning its baseline,
+		 * not a fault. */
+		if (rec.voc == SNTL_AQ_UNKNOWN_S) {
+			printk("  voc --");
+		} else {
+			printk("  voc %d.%d", rec.voc / 10, rec.voc % 10);
+		}
+		printk("%s\n", (rec.flags & SNTL_FLAG_AQ_FAULT) ? "  AQ_FAULT" : "");
+	}
 }
 
 int main(void)
@@ -174,11 +215,21 @@ int main(void)
 		printk("[ERROR] radar start failed (%d) - check uart1 and NRST wiring\n", err);
 	}
 
+	/* Not fatal either: a node with a dead SEN5x still records occupancy,
+	 * and every record it writes says so through SNTL_FLAG_AQ_FAULT. */
+	err = sen5x_start();
+	if (err) {
+		printk("[ERROR] SEN5x start failed (%d) - air quality will read unknown\n", err);
+	}
+
 	/* Absolute cadence rather than k_msleep(1000) at the end, so a slow NVS
 	 * write does not stretch the record period. */
 	next_tick = k_uptime_get() + 1000;
 
 	while (1) {
+		/* ~20 ms on the bus; the absolute cadence below absorbs it. */
+		sen5x_poll();
+
 		if (++sec >= STORE_PERIOD_S) {
 			sec = 0;
 			window_flush();

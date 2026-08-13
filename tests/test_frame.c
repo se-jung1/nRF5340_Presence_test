@@ -21,8 +21,8 @@ static void check_crc_vector(void)
 static void check_frame_sizes(void)
 {
 	assert(sntl_frame_size(0) == 18);
-	assert(sntl_frame_size(2) == 46);          /* 16 + 28 + 2 */
-	assert(sntl_frame_size(2880) == 40338);    /* a full 24 h at 30 s */
+	assert(sntl_frame_size(2) == 66);          /* 16 + 48 + 2 */
+	assert(sntl_frame_size(2880) == 69138);    /* a full 24 h at 30 s */
 }
 
 static void check_header(void)
@@ -31,8 +31,8 @@ static void check_header(void)
 
 	sntl_encode_header(h, 2, "PRA3F92C");
 	assert(h[0] == 0x53 && h[1] == 0x4E && h[2] == 0x54 && h[3] == 0x4C);
-	assert(h[4] == 2);                          /* version: presence node */
-	assert(h[5] == 14);                         /* recordSize */
+	assert(h[4] == 3);                          /* version: presence + air */
+	assert(h[5] == 24);                         /* recordSize */
 	assert(h[6] == 2 && h[7] == 0);             /* recordCount LE */
 	assert(memcmp(h + 8, "PRA3F92C", 8) == 0);
 
@@ -61,6 +61,7 @@ static void check_record_encoding(void)
 		.seq = 0x11223344, .ts = 0x55667788,
 		.headcount = 3, .occ_s = 27, .dwell_s = 0x0403,
 		.flags = SNTL_FLAG_RTC_UNSET | SNTL_FLAG_NO_TRACKER, .batt = 100,
+		.pm25 = 123, .pm10 = 456, .temp = 2350, .rh = 4512, .voc = 1005,
 	};
 	uint8_t b[SNTL_RECORD_SIZE];
 
@@ -70,6 +71,19 @@ static void check_record_encoding(void)
 	assert(b[8] == 3 && b[9] == 27);
 	assert(b[10] == 0x03 && b[11] == 0x04);     /* dwell_s LE */
 	assert(b[12] == 0x24 && b[13] == 100);      /* RTC_UNSET | NO_TRACKER */
+	assert(b[14] == 123 && b[15] == 0);         /* pm25 = 12.3 ug/m3 */
+	assert(b[16] == 0xC8 && b[17] == 0x01);     /* pm10 = 45.6 ug/m3 */
+	assert(b[18] == 0x2E && b[19] == 0x09);     /* temp = 23.50 C */
+	assert(b[20] == 0xA0 && b[21] == 0x11);     /* rh = 45.12 %RH */
+	assert(b[22] == 0xED && b[23] == 0x03);     /* voc index 100.5 */
+
+	/* A sub-zero temperature has to survive the trip as two's complement,
+	 * and it must not collide with the "not measured" sentinel. */
+	r.temp = -1250;                             /* -12.50 C */
+	r.rh = SNTL_AQ_UNKNOWN_S;
+	sntl_encode_record(b, &r);
+	assert(b[18] == 0x1E && b[19] == 0xFB);
+	assert(b[20] == 0xFF && b[21] == 0x7F);
 }
 
 static void check_cmd_parsing(void)

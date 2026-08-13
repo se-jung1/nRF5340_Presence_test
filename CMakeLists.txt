@@ -6,6 +6,7 @@ project(nRF5340_Presence)
 target_sources(app PRIVATE
     src/main.c
     src/radar.c
+    src/sen5x.c
     src/tlv.c
     src/frame.c
     src/store.c

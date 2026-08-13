@@ -123,7 +123,7 @@ static int notify_chunk(struct bt_conn *conn, const uint8_t *data, uint16_t len)
  * Stream one frame: header, then records, then CRC. The frame is emitted
  * straight into MTU-sized notifications with no per-chunk framing - the app
  * concatenates and uses the header's record count to find the end. A full day
- * is ~40 KB, so it is built incrementally rather than buffered.
+ * is ~69 KB, so it is built incrementally rather than buffered.
  */
 static void dump_run(struct bt_conn *conn, uint32_t first_seq)
 {
@@ -154,7 +154,13 @@ static void dump_run(struct bt_conn *conn, uint32_t first_seq)
 			 * record count the app is counting down. */
 			memset(&rec, 0, sizeof(rec));
 			rec.seq = seq;
-			rec.flags = SNTL_FLAG_SENSOR_FAULT;
+			rec.flags = SNTL_FLAG_SENSOR_FAULT | SNTL_FLAG_AQ_FAULT;
+			/* Zeroed air quality would read as pristine air. */
+			rec.pm25 = SNTL_AQ_UNKNOWN_U;
+			rec.pm10 = SNTL_AQ_UNKNOWN_U;
+			rec.temp = SNTL_AQ_UNKNOWN_S;
+			rec.rh   = SNTL_AQ_UNKNOWN_S;
+			rec.voc  = SNTL_AQ_UNKNOWN_S;
 		}
 
 		if (fill + SNTL_RECORD_SIZE > chunk) {
